@@ -12,7 +12,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-
+from pymongo.errors import DuplicateKeyError 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -125,25 +125,29 @@ def list_employees(department: Optional[str] = None, page: int = 1, page_size: i
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if emp is None:
         raise HTTPException(status_code=404, detail="Employee not found")
-    
+
     if body.punched_at is not None:
         if not isinstance(body.punched_at, int) or isinstance(body.punched_at, bool) or body.punched_at < 100000000000:
             raise HTTPException(status_code=422, detail="Timestamps must be epoch milliseconds")
-    try:
-        ts = datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc).replace(tzinfo=None)
-    except (OverflowError, OSError, ValueError):
-        raise HTTPException(status_code=422, detail="Invalid timestamp")
+        try:
+            ts = datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc).replace(tzinfo=None)
+        except (OverflowError, OSError, ValueError):
+            raise HTTPException(status_code=422, detail="Invalid timestamp")
     else:
         ts = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    d = ts.date().isoformat()
+    ts = ts.replace(microsecond=0)
+    d = (ts.replace(tzinfo=timezone.utc) + timedelta(hours=5, minutes=30)).date().isoformat()
+
     if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+        raise HTTPException(status_code=409, detail="Already punched in for this date")
+
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -156,10 +160,25 @@ def punch_in(body: PunchInIn):
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc 
+
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="Already punched in for this date")
+
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": int(ts.replace(tzinfo=timezone.utc).timestamp() * 1000),
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": doc["late_minutes"],
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+
 
 
 @app.post("/attendance/punch-out")
